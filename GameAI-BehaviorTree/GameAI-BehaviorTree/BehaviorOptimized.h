@@ -1,0 +1,317 @@
+#pragma once
+#include<vector>
+#include<string>
+#include<iostream>
+#include<assert.h>
+#include <random>
+#include <functional>
+
+namespace BTOptimized
+{
+	
+	//行为树返回状态
+	enum class EStatus :uint8_t
+	{
+		Invalid,   //初始状态
+		Success,   //成功
+		Failure,   //失败
+		Running,   //运行
+		Aborted,   //终止
+	};
+
+	//Parallel节点成功与失败的要求，是全部成功/失败，还是一个成功/失败
+	enum class EPolicy :uint8_t
+	{
+		RequireOne,
+		RequireAll,
+	};
+
+	class Behavior
+	{
+	public:
+		friend class BehaviorTree;
+		//包装函数，防止打破调用契约
+		EStatus Tick();
+
+		EStatus GetStatus() { return Status; }
+
+		void Reset() { Status = EStatus::Invalid; }
+		void Abort() { OnTerminate(EStatus::Aborted); Status = EStatus::Aborted; }
+
+		bool IsTerminate() { return Status == EStatus::Success || Status == EStatus::Failure; }
+		bool IsRunning() { return Status == EStatus::Running; }
+		bool IsSuccess() { return Status == EStatus::Success; }
+		bool IsFailuer() { return Status == EStatus::Failure; }
+
+		virtual std::string Name() = 0;
+		virtual void AddChild(Behavior* Child) {};
+
+	protected:
+		Behavior() :Status(EStatus::Invalid) {}
+		virtual ~Behavior() {}
+
+		virtual void OnInitialize() {};
+		virtual EStatus Update() = 0;
+		virtual void OnTerminate(EStatus Status) {};
+
+	protected:
+		EStatus Status;
+	};
+
+	//装饰器
+	class Decorator :public Behavior
+	{
+	public:
+		friend class BehaviorTree;
+		virtual void AddChild(Behavior* InChild) { Child = InChild; }
+	protected:
+		Decorator() {}
+		virtual ~Decorator() {}
+		Behavior* Child;
+	};
+
+	//重复执行子节点的装饰器
+	class Repeat :public Decorator
+	{
+	public:
+		friend class BehaviorTree;
+		static Behavior* Create(int InLimited) { return new Repeat(InLimited); }
+		virtual std::string Name() override { return "Repeat"; }
+
+	protected:
+		Repeat(int InLimited) :Limited(InLimited) {}
+		virtual ~Repeat() {}
+		virtual void OnInitialize() { Count = 0; }
+		virtual EStatus Update()override;
+		virtual Behavior* Create() { return nullptr; }
+	protected:
+		int Limited = 3;
+		int Count = 0;
+	};
+
+	const size_t MaxChildrenPerComposite = 7;
+
+	//复合节点基类
+	class Composite :public Behavior
+	{
+	public:
+		friend class BehaviorTree;
+		virtual void AddChild(Behavior* InChild) override
+		{ 
+			assert(ChildrenCount < MaxChildrenPerComposite);
+			ptrdiff_t p = (uintptr_t)InChild - (uintptr_t)this;
+			assert(p < std::numeric_limits<uint16_t>::max());
+			Children[ChildrenCount++] = static_cast<uint16_t>(p);
+		}	
+
+		Behavior* GetChild(size_t index)
+		{
+			assert(index < MaxChildrenPerComposite);
+			return (Behavior*)((uintptr_t)this + Children[index]);
+		}
+
+		size_t GetChildrenCount()
+		{
+			return ChildrenCount;
+		}
+
+		void RemoveChild(size_t InChild);
+		void ClearChild() 
+		{ 
+			for (int i = 0; i < MaxChildrenPerComposite; ++i)
+			{
+				Children[i] = 0;
+			}
+		}
+
+	protected:
+		Composite() {}
+		virtual ~Composite() {}
+		uint16_t Children[MaxChildrenPerComposite];
+		uint16_t ChildrenCount = 0;
+	};
+
+	//顺序器：依次执行所有节点直到其中一个失败或者全部成功位置
+	class Sequence :public Composite
+	{
+	public:
+		friend class BehaviorTree;
+		virtual std::string Name() override { return "Sequence"; }
+		static Behavior* Create() { return new Sequence(); }
+	protected:
+		Sequence() {}
+		virtual ~Sequence() {}
+		virtual void OnInitialize() override { CurrChild = 0; }
+		virtual EStatus Update() override;
+
+	protected:
+		uint16_t CurrChild=0;
+	};
+
+	
+	//选择器:依次执行每个子节点直到其中一个执行成功或者返回Running状态
+	class Selector :public Composite
+	{
+	public:
+		friend class BehaviorTree;
+		static Behavior* Create() { return new Selector(); }
+		virtual std::string Name() override { return "Selector"; }
+
+	protected:
+		Selector() {}
+		virtual ~Selector() {}
+		virtual void OnInitialize() override { CurrChild = 0; }
+		virtual EStatus Update() override;
+
+	protected:
+		uint16_t CurrChild=0;
+	};
+
+	//并行器：多个行为并行执行
+	class Parallel :public Composite
+	{
+	public:
+		friend class BehaviorTree;
+		static Behavior* Create(EPolicy InSucess, EPolicy InFailure) { return new Parallel(InSucess, InFailure); }
+		virtual std::string Name() override { return "Parallel"; }
+
+	protected:
+		Parallel(EPolicy InSucess, EPolicy InFailure) :SucessPolicy(InSucess), FailurePolicy(InFailure) {}
+		virtual ~Parallel() {}
+		virtual EStatus Update() override;
+		virtual void OnTerminate(EStatus InStatus) override;
+
+	protected:
+		EPolicy SucessPolicy;
+		EPolicy FailurePolicy;
+	};
+
+
+	//主动选择器：执行过程中不断检查高优先级行为的可行性,高优先级行为可中断低优先级行为
+	class ActiveSelector :public Selector
+	{
+	public:
+		friend class BehaviorTree;
+		static Behavior* Create() { return new ActiveSelector(); }
+		//开始时把当前节点置为end
+		virtual void OnInitialize() override { CurrChild = ChildrenCount; }
+		virtual std::string Name() override { return "ActiveSelector"; }
+	protected:
+		ActiveSelector() {}
+		virtual ~ActiveSelector() {}
+		virtual EStatus Update() override;
+	};
+
+	//条件基类
+	class Condition :public Behavior
+	{
+	public:
+		friend class BehaviorTree;
+	protected:
+		Condition(bool InIsNegation) :IsNegation(InIsNegation) {}
+		virtual ~Condition() {}
+
+	protected:
+		//是否取反
+		bool  IsNegation = false;
+	};
+
+	//动作基类
+	class Action :public Behavior
+	{
+	public:
+		friend class BehaviorTree;
+	protected:
+		Action() {}
+		virtual ~Action() {}
+	};
+
+	//看见敌人条件
+	class Condition_IsSeeEnemy :public Condition
+	{
+	public:
+		friend class BehaviorTree;
+		static Behavior* Create(bool InIsNegation) { return new Condition_IsSeeEnemy(InIsNegation); }
+		virtual std::string Name() override { return "Condtion_IsSeeEnemy"; }
+
+	protected:
+		Condition_IsSeeEnemy(bool InIsNegation) :Condition(InIsNegation) {}
+		virtual ~Condition_IsSeeEnemy() {}
+		virtual EStatus Update() override;
+	};
+
+	//血量低条件
+	class Condition_IsHealthLow :public Condition
+	{
+	public:
+		friend class BehaviorTree;
+		static Behavior* Create(bool InIsNegation) { return new Condition_IsHealthLow(InIsNegation); }
+		virtual std::string Name() override { return "Condition_IsHealthLow"; }
+
+	protected:
+		Condition_IsHealthLow(bool InIsNegation) :Condition(InIsNegation) {}
+		virtual ~Condition_IsHealthLow() {}
+		virtual EStatus Update() override;
+
+	};
+
+	// 敌人死亡条件
+	class Condition_IsEnemyDead :public Condition
+	{
+	public:
+		friend class BehaviorTree;
+		static Behavior* Create(bool InIsNegation) { return new Condition_IsEnemyDead(InIsNegation); }
+		virtual std::string Name() override { return "Condition_IsHealthLow"; }
+
+	protected:
+		Condition_IsEnemyDead(bool InIsNegation) :Condition(InIsNegation) {}
+		virtual ~Condition_IsEnemyDead() {}
+		virtual EStatus Update() override;
+
+	};
+
+	//攻击动作
+	class Action_Attack :public Action
+	{
+	public:
+		friend class BehaviorTree;
+		static Behavior* Create() { return new Action_Attack(); }
+		virtual std::string Name() override { return "Action_Attack"; }
+
+	protected:
+		Action_Attack() {}
+		virtual ~Action_Attack() {}
+		virtual EStatus Update() override;
+	};
+
+	//逃跑动作
+	class Action_Runaway :public Action
+	{
+	public:
+		friend class BehaviorTree;
+		static Behavior* Create() { return new Action_Runaway(); }
+		virtual std::string Name() override { return "Action_Runaway"; }
+
+	protected:
+		Action_Runaway() {}
+		virtual ~Action_Runaway() {}
+		virtual EStatus Update() override;
+	};
+
+	//巡逻动作
+	class Action_Patrol :public Action
+	{
+	public:
+		friend class BehaviorTree;
+		static Behavior* Create() { return new Action_Patrol(); }
+		virtual std::string Name() override { return "Action_Patrol"; }
+
+	protected:
+		Action_Patrol() {}
+		virtual ~Action_Patrol() {}
+		virtual EStatus Update() override;
+	};
+}
+
+
+
